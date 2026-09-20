@@ -17,3 +17,5 @@ pandas
 requests
 geocoder
 websocket-client
+psycopg2-binary
+asyncpg
