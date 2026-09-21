@@ -60,11 +60,58 @@ async def _relogin_all_live_clients():
     logger.info("[scheduler] Daily re-login complete")
 
 
+async def _restore_sessions_from_db():
+    """
+    On startup: reload in-memory sessions for all clients that have valid
+    stored tokens in the DB (is_live=True and auth_token not null).
+    This prevents orders from returning 'not logged in' after a server restart.
+    """
+    from app.models.client import MofslClient
+    from app.services.mofsl_client import MofslClientService
+    from app.services import session_manager
+    from sqlalchemy import select
+
+    logger.info("[startup] Restoring sessions from DB …")
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(MofslClient).where(
+                MofslClient.is_live == True,
+                MofslClient.is_active == True,
+                MofslClient.auth_token.isnot(None),
+                MofslClient.access_token.isnot(None),
+            )
+        )
+        clients = result.scalars().all()
+
+        for client in clients:
+            svc = MofslClientService(
+                client_id=client.client_id,
+                api_key=client.api_key,
+                api_secret=client.api_secret,
+                totp_secret=client.totp_secret,
+                password_hash=client.password_hash,
+                two_fa=client.two_fa,
+            )
+            await session_manager.set_client(
+                client.user_id,
+                client.id,
+                svc,
+                client.auth_token,
+                client.access_token,
+            )
+            logger.info("[startup] Restored session for client %s (%s)", client.name, client.client_id)
+
+    logger.info("[startup] Session restore complete — %d client(s) loaded", len(clients))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     await init_db()
     logger.info("Database initialized")
+
+    # Restore in-memory sessions from DB so orders work immediately after restart
+    await _restore_sessions_from_db()
 
     # Schedule daily re-login at 06:10 IST (00:40 UTC)
     scheduler.add_job(
