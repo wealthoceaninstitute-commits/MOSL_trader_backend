@@ -209,6 +209,43 @@ async def order_book(
         raise HTTPException(status_code=502, detail=str(exc))
 
 
+@router.get("/debug-raw")
+async def debug_raw_orders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    DEBUG: Returns the raw MOFSL order book response for the first live client.
+    Use this to inspect the actual API response structure.
+    Remove before production.
+    """
+    result = await db.execute(
+        select(MofslClient).where(
+            MofslClient.user_id == current_user.id,
+            MofslClient.is_live == True,
+        )
+    )
+    client = result.scalars().first()
+    if not client:
+        return {"error": "No live clients found", "is_live_clients": []}
+
+    session = await session_manager.get_client(current_user.id, client.id)
+    if not session:
+        return {
+            "error": "Client is marked is_live in DB but has no in-memory session — need to login again",
+            "client_id": client.id,
+            "client_name": client.name,
+            "auth_token_in_db": bool(client.auth_token),
+        }
+
+    svc = session["service"]
+    try:
+        raw = await svc.get_order_book(session["auth_token"], session["access_token"])
+        return {"client_id": client.id, "client_name": client.name, "raw_response": raw}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 @router.get("/trades")
 async def trade_book(
     client_id: int = Query(...),
