@@ -221,7 +221,7 @@ class MofslClientService:
     # ------------------------------------------------------------------
 
     async def get_order_book(self, auth_token: str, access_token: str) -> Dict[str, Any]:
-        payload = {"clientcode": self.client_id, "dateandtime": ""}
+        payload = {"clientcode": "", "dateandtime": ""}  # empty clientcode required (MO2031)
         return await self._post("/rest/book/v5/getorderbook", payload, auth_token, access_token)
 
     async def get_trade_book(self, auth_token: str, access_token: str) -> Dict[str, Any]:
