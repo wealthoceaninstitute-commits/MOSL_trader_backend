@@ -34,3 +34,16 @@ class CancelOrderRequest(BaseModel):
     uniqueorderid: str
     exchange: str
     client_id: int
+
+
+class CancelOrderItem(BaseModel):
+    order_id: str
+    client_id: int
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    broker: Optional[str] = None
+    exchange: Optional[str] = None
+
+
+class BatchCancelRequest(BaseModel):
+    orders: List[CancelOrderItem]
