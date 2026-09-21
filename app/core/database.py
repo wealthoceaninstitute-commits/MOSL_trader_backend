@@ -3,10 +3,14 @@ from sqlalchemy.orm import DeclarativeBase
 from app.core.config import settings
 
 
+_db_url = settings.DATABASE_URL
+# SQLite needs check_same_thread=False; PostgreSQL does not accept it
+_connect_args = {"check_same_thread": False} if _db_url.startswith("sqlite") else {}
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _db_url,
     echo=False,
-    connect_args={"check_same_thread": False},
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
