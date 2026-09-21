@@ -1,4 +1,6 @@
-from typing import Any, Dict, List
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -12,6 +14,8 @@ from app.schemas.order import CancelOrderRequest, ModifyOrderRequest, PlaceOrder
 from app.services import session_manager
 from app.services.copy_engine import fan_out
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
@@ -21,6 +25,91 @@ async def _require_session(db: AsyncSession, user_id: int, client_db_id: int):
     if not session:
         raise HTTPException(status_code=400, detail=f"Client {client_db_id} is not logged in")
     return session
+
+
+def _classify_status(status: str) -> str:
+    """Map MOFSL order status strings to frontend bucket keys."""
+    s = str(status).upper()
+    if s in ("OPEN", "PENDING", "TRIGGER PENDING", "AFTER MARKET ORDER REQ RECEIVED",
+             "MODIFY PENDING", "CANCEL PENDING", "OPEN PENDING"):
+        return "pending"
+    if s in ("COMPLETE", "TRADED", "FILLED"):
+        return "traded"
+    if s in ("REJECTED", "VALIDATION PENDING"):
+        return "rejected"
+    if s in ("CANCELLED", "CANCELLED AFTER MARKET ORDER"):
+        return "cancelled"
+    return "others"
+
+
+def _normalize_order(raw: Dict[str, Any], client_name: str, client_db_id: int) -> Dict[str, Any]:
+    """Flatten a MOFSL order dict into the shape the frontend expects."""
+    return {
+        "order_id": raw.get("uniqueorderid") or raw.get("orderid") or raw.get("order_id"),
+        "symbol": raw.get("scripname") or raw.get("symbol") or raw.get("tradingsymbol"),
+        "transaction_type": (raw.get("buysell") or raw.get("transactiontype") or raw.get("transaction_type") or "").upper(),
+        "quantity": raw.get("quantity") or raw.get("qty") or raw.get("quantityinlot"),
+        "price": raw.get("price") or raw.get("limitprice"),
+        "status": raw.get("orderstatus") or raw.get("status"),
+        "name": client_name,
+        "client_id": client_db_id,
+        # passthrough extras useful for cancel/modify
+        "exchange": raw.get("exchange") or raw.get("exchangename"),
+        "broker": "mofsl",
+    }
+
+
+@router.get("")
+async def list_all_orders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Aggregate order books from ALL live clients for the current user.
+    Returns {pending, traded, rejected, cancelled, others} buckets.
+    """
+    result = await db.execute(
+        select(MofslClient).where(
+            MofslClient.user_id == current_user.id,
+            MofslClient.is_live == True,
+            MofslClient.is_active == True,
+        )
+    )
+    live_clients = result.scalars().all()
+
+    buckets: Dict[str, List[Dict[str, Any]]] = {
+        "pending": [], "traded": [], "rejected": [], "cancelled": [], "others": []
+    }
+
+    async def _fetch_one(client: MofslClient):
+        session = await session_manager.get_client(current_user.id, client.id)
+        if not session:
+            logger.warning("No in-memory session for client %s (id=%s) — skipping", client.client_id, client.id)
+            return
+        svc = session["service"]
+        try:
+            resp = await svc.get_order_book(session["auth_token"], session["access_token"])
+            # MOFSL returns data under "data" key as a list
+            orders_raw: List[Dict[str, Any]] = []
+            data = resp.get("data") or []
+            if isinstance(data, list):
+                orders_raw = data
+            elif isinstance(data, dict):
+                # Some versions nest under "orderbook"
+                orders_raw = data.get("orderbook") or data.get("orders") or []
+
+            for raw in orders_raw:
+                if not isinstance(raw, dict):
+                    continue
+                status_str = raw.get("orderstatus") or raw.get("status") or ""
+                bucket = _classify_status(status_str)
+                normalized = _normalize_order(raw, client.name or client.client_id, client.id)
+                buckets[bucket].append(normalized)
+        except Exception as exc:
+            logger.error("Failed to fetch order book for client %s: %s", client.client_id, exc)
+
+    await asyncio.gather(*[_fetch_one(c) for c in live_clients])
+    return buckets
 
 
 @router.post("/place")
