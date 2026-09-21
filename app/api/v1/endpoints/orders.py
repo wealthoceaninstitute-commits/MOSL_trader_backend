@@ -33,7 +33,8 @@ def _classify_status(status: str) -> str:
     # Pending / open states
     if s in ("OPEN", "PENDING", "TRIGGER PENDING", "AFTER MARKET ORDER REQ RECEIVED",
              "MODIFY PENDING", "CANCEL PENDING", "OPEN PENDING", "PLACED",
-             "NOT MODIFIED", "MODIFY VALIDATION PENDING", "MODIFY AFTER MARKET ORDER REQ RECEIVED"):
+             "NOT MODIFIED", "MODIFY VALIDATION PENDING", "MODIFY AFTER MARKET ORDER REQ RECEIVED",
+             "CONFIRM", "CONFIRMED", "NEW"):
         return "pending"
     # Traded / filled
     if s in ("COMPLETE", "TRADED", "FILLED", "FULLY EXECUTED", "PARTIAL EXECUTED"):
@@ -57,7 +58,7 @@ def _normalize_order(raw: Dict[str, Any], client_name: str, client_db_id: int) -
         "order_id":        raw.get("uniqueorderid") or raw.get("orderid") or raw.get("order_id"),
         "symbol":          raw.get("scripname") or raw.get("symbol") or raw.get("tradingsymbol"),
         "transaction_type":(raw.get("buysell") or raw.get("transactiontype") or raw.get("buyorsell") or "").upper(),
-        "quantity":        raw.get("quantityinlot") or raw.get("quantity") or raw.get("qty"),
+        "quantity":        raw.get("quantityinlot") or raw.get("totalqty") or raw.get("quantity") or raw.get("qty") or raw.get("orderqty"),
         "price":           raw.get("limitprice") or raw.get("price"),
         "status":          status_raw,
         "name":            client_name,
