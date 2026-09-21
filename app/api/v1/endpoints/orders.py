@@ -210,7 +210,13 @@ async def cancel_order(
                 item.order_id,
                 item.exchange or "",
             )
-            results.append({"order_id": item.order_id, "status": resp.get("status"), "response": resp})
+            logger.info("CancelOrder response for %s: %s", item.order_id, resp)
+            resp_status = resp.get("status", "")
+            resp_msg = resp.get("message") or resp.get("msg") or resp.get("errormessage") or str(resp)
+            if str(resp_status).upper() in ("FAILED", "ERROR", "FAILURE"):
+                results.append({"order_id": item.order_id, "status": "ERROR", "message": resp_msg})
+            else:
+                results.append({"order_id": item.order_id, "status": resp_status, "response": resp})
         except Exception as exc:
             logger.error("Cancel order %s failed: %s", item.order_id, exc)
             results.append({"order_id": item.order_id, "status": "ERROR", "message": str(exc)})
