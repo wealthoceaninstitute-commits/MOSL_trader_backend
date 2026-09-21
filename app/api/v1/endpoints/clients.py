@@ -52,6 +52,7 @@ async def create_client(
 
 
 @router.patch("/clients/{client_id}", response_model=MofslClientOut)
+@router.put("/clients/{client_id}", response_model=MofslClientOut)
 async def update_client(
     client_id: int,
     payload: MofslClientUpdate,
