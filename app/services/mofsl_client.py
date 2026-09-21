@@ -96,8 +96,8 @@ class MofslClientService:
         self.os_version = "20.04"
         self.device_model = "VMware Virtual Platform"
         self.manufacturer = "unknown"
-        self.product_name = settings.MOFSL_PRODUCT_NAME
-        self.product_version = settings.MOFSL_PRODUCT_VERSION
+        self.product_name = "Investor"
+        self.product_version = "1"
         self.latitude = "19.0760"
         self.longitude = "72.8777"
 
@@ -128,7 +128,7 @@ class MofslClientService:
             "productversion": self.product_version,
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "sdkversion": "Python 3.0",
+            "sdkversion": "Python 5.0",
         }
         if access_token:
             headers["accesstoken"] = access_token
@@ -180,8 +180,8 @@ class MofslClientService:
         if not auth_token:
             raise RuntimeError("MOFSL login returned no AuthToken")
 
-        # Step 2: getaccesstoken
-        access_payload = {"userid": self.client_id}
+        # Step 2: getaccesstoken — SDK sends {"clientcode": ""} (empty string)
+        access_payload = {"clientcode": ""}
         access_resp = await self._post("/rest/login/v1/getaccesstoken", access_payload, auth_token=auth_token)
         if access_resp.get("status") != "SUCCESS":
             raise RuntimeError(f"MOFSL getaccesstoken failed: {access_resp.get('message', access_resp)}")
@@ -200,12 +200,12 @@ class MofslClientService:
     async def place_order(self, auth_token: str, access_token: str, order_data: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(order_data)
         payload.setdefault("clientcode", self.client_id)
-        return await self._post("/rest/trans/v1/placeorder", payload, auth_token, access_token)
+        return await self._post("/rest/trans/v2/placeorder", payload, auth_token, access_token)
 
     async def modify_order(self, auth_token: str, access_token: str, order_data: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(order_data)
         payload.setdefault("clientcode", self.client_id)
-        return await self._post("/rest/trans/v2/modifyorder", payload, auth_token, access_token)
+        return await self._post("/rest/trans/v5/modifyorder", payload, auth_token, access_token)
 
     async def cancel_order(self, auth_token: str, access_token: str, uniqueorderid: str, exchange: str = "") -> Dict[str, Any]:
         payload = {
@@ -214,20 +214,19 @@ class MofslClientService:
         }
         if exchange:
             payload["exchange"] = exchange
-        return await self._post("/rest/trans/v1/cancelorder", payload, auth_token, access_token)
+        return await self._post("/rest/trans/v2/cancelorder", payload, auth_token, access_token)
 
     # ------------------------------------------------------------------
     # Books
     # ------------------------------------------------------------------
 
     async def get_order_book(self, auth_token: str, access_token: str) -> Dict[str, Any]:
-        today = datetime.now().strftime("%d-%b-%Y 09:00:00")
-        payload = {"clientcode": self.client_id, "datetimestamp": today}
-        return await self._post("/rest/book/v1/getorderbook", payload, auth_token, access_token)
+        payload = {"clientcode": self.client_id, "dateandtime": ""}
+        return await self._post("/rest/book/v5/getorderbook", payload, auth_token, access_token)
 
     async def get_trade_book(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"clientcode": self.client_id}
-        return await self._post("/rest/book/v1/gettradebook", payload, auth_token, access_token)
+        return await self._post("/rest/book/v4/gettradebook", payload, auth_token, access_token)
 
     # ------------------------------------------------------------------
     # Portfolio
@@ -235,15 +234,15 @@ class MofslClientService:
 
     async def get_positions(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"clientcode": self.client_id}
-        return await self._post("/rest/book/v1/getposition", payload, auth_token, access_token)
+        return await self._post("/rest/book/v4/getposition", payload, auth_token, access_token)
 
     async def get_holdings(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"clientcode": self.client_id}
-        return await self._post("/rest/report/v1/getdpholding", payload, auth_token, access_token)
+        return await self._post("/rest/report/v3/getdpholding", payload, auth_token, access_token)
 
     async def get_margin_summary(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"clientcode": self.client_id}
-        return await self._post("/rest/report/v1/getreportmarginsummary", payload, auth_token, access_token)
+        return await self._post("/rest/report/v3/getreportmarginsummary", payload, auth_token, access_token)
 
     # ------------------------------------------------------------------
     # Market data
@@ -255,7 +254,7 @@ class MofslClientService:
             "exchange": exchange,
             "scripcode": scripcode,
         }
-        return await self._post("/rest/report/v1/getltpdata", payload, auth_token, access_token)
+        return await self._post("/rest/report/v3/getltpdata", payload, auth_token, access_token)
 
     async def get_scrips(self, auth_token: str, access_token: str, exchangename: str, searchscrip: str) -> Dict[str, Any]:
         payload = {
@@ -263,7 +262,7 @@ class MofslClientService:
             "exchangename": exchangename,
             "searchscrip": searchscrip,
         }
-        return await self._post("/rest/report/v1/getscripsbyexchangename", payload, auth_token, access_token)
+        return await self._post("/rest/report/v3/getscripsbyexchangename", payload, auth_token, access_token)
 
     # ------------------------------------------------------------------
     # Profile / logout
@@ -271,8 +270,8 @@ class MofslClientService:
 
     async def get_profile(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"clientcode": self.client_id}
-        return await self._post("/rest/login/v1/getprofile", payload, auth_token, access_token)
+        return await self._post("/rest/login/v5/getprofile", payload, auth_token, access_token)
 
     async def logout(self, auth_token: str, access_token: str) -> Dict[str, Any]:
         payload = {"userid": self.client_id}
-        return await self._post("/rest/login/v1/logout", payload, auth_token, access_token)
+        return await self._post("/rest/login/v5/logout", payload, auth_token, access_token)
