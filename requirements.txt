@@ -1,3 +1,4 @@
+# deps v2
 fastapi
 uvicorn[standard]
 httpx
@@ -8,8 +9,10 @@ pydantic-settings
 email-validator
 sqlalchemy
 aiosqlite
+asyncpg
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt==4.0.1
 python-multipart
 pyotp
 apscheduler
@@ -17,4 +20,3 @@ pandas
 requests
 geocoder
 websocket-client
-bcrypt==4.0.1
