@@ -144,7 +144,7 @@ class MofslClientService:
     async def login(self) -> Tuple[str, str]:
         """
         Perform MOFSL two-step login:
-          1. POST /rest/login/v4/authdirectapi  -> AuthToken
+          1. POST /rest/login/v7/authdirectapi  -> AuthToken
           2. POST /rest/login/v1/getaccesstoken -> AccessToken
 
         Returns (auth_token, access_token).
@@ -164,7 +164,7 @@ class MofslClientService:
             "totp": totp_code,
         }
 
-        login_resp = await self._post("/rest/login/v4/authdirectapi", login_payload)
+        login_resp = await self._post("/rest/login/v7/authdirectapi", login_payload)
         if login_resp.get("status") != "SUCCESS":
             raise RuntimeError(f"MOFSL authdirectapi failed: {login_resp.get('message', login_resp)}")
 
