@@ -10,7 +10,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.client import MofslClient
 from app.models.user import User
-from app.schemas.order import CancelOrderRequest, ModifyOrderRequest, PlaceOrderRequest
+from app.schemas.order import BatchCancelRequest, CancelOrderRequest, ModifyOrderRequest, PlaceOrderRequest
 from app.services import session_manager
 from app.services.copy_engine import fan_out
 
@@ -188,22 +188,43 @@ async def modify_order(
 
 @router.post("/cancel")
 async def cancel_order(
-    payload: CancelOrderRequest,
+    payload: BatchCancelRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    session = await _require_session(db, current_user.id, payload.client_id)
-    svc = session["service"]
-    try:
-        resp = await svc.cancel_order(
-            session["auth_token"],
-            session["access_token"],
-            payload.uniqueorderid,
-            payload.exchange,
-        )
-        return resp
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+    """
+    Cancel one or more pending orders.
+    Accepts { orders: [{ order_id, client_id, exchange?, ... }] }
+    """
+    results = []
+    for item in payload.orders:
+        try:
+            session = await session_manager.get_client(current_user.id, item.client_id)
+            if not session:
+                results.append({"order_id": item.order_id, "status": "ERROR", "message": f"Client {item.client_id} not logged in"})
+                continue
+            svc = session["service"]
+            resp = await svc.cancel_order(
+                session["auth_token"],
+                session["access_token"],
+                item.order_id,
+                item.exchange or "",
+            )
+            results.append({"order_id": item.order_id, "status": resp.get("status"), "response": resp})
+        except Exception as exc:
+            logger.error("Cancel order %s failed: %s", item.order_id, exc)
+            results.append({"order_id": item.order_id, "status": "ERROR", "message": str(exc)})
+
+    # Build a summary message
+    success = [r for r in results if r.get("status") not in ("ERROR",)]
+    failed = [r for r in results if r.get("status") == "ERROR"]
+    message_parts = []
+    if success:
+        message_parts.append(f"{len(success)} order(s) cancel request sent")
+    if failed:
+        message_parts.append(f"{len(failed)} failed: " + "; ".join(r["message"] for r in failed))
+
+    return {"results": results, "message": message_parts}
 
 
 @router.get("/book")
