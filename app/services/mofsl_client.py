@@ -44,7 +44,15 @@ def _local_ip() -> str:
         return "1.2.3.4"
 
 
-def _installed_app_id() -> str:
+def _installed_app_id(client_id: str = "") -> str:
+    """
+    Generate a stable installedappid derived from the client_id so it stays
+    the same across server restarts. MOFSL ties the token to the app ID used
+    at login time — a new random UUID each restart causes 'Invalid Token'.
+    """
+    if client_id:
+        # Deterministic UUID based on client_id string
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"mofsl-{client_id}"))
     return str(uuid.uuid1())
 
 
@@ -82,7 +90,7 @@ class MofslClientService:
         self.public_ip = public_ip or settings.STATIC_IP or "1.2.3.4"
         self.local_ip = _local_ip()
         self.mac_address = _mac_address()
-        self.installed_app_id = _installed_app_id()
+        self.installed_app_id = _installed_app_id(client_id)
         self.source_id = "Desktop"
         self.os_name = "Ubuntu 20.04.3 LTS"
         self.os_version = "20.04"
