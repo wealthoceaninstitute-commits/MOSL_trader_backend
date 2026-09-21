@@ -216,13 +216,13 @@ async def cancel_order(
             results.append({"order_id": item.order_id, "status": "ERROR", "message": str(exc)})
 
     # Build a summary message
-    success = [r for r in results if r.get("status") not in ("ERROR",)]
+    success = [r for r in results if r.get("status") != "ERROR"]
     failed = [r for r in results if r.get("status") == "ERROR"]
     message_parts = []
     if success:
         message_parts.append(f"{len(success)} order(s) cancel request sent")
     if failed:
-        message_parts.append(f"{len(failed)} failed: " + "; ".join(r["message"] for r in failed))
+        message_parts.append(f"{len(failed)} failed: " + "; ".join(r.get("message", "unknown error") for r in failed))
 
     return {"results": results, "message": message_parts}
 
