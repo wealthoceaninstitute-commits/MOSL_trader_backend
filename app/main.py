@@ -92,18 +92,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
-app = FastAPI(title="WOI AutoTrader API")
-
-# CORS — must be FIRST middleware
+# CORS — must be added before routers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
 # Routers
 app.include_router(api_router)
 
