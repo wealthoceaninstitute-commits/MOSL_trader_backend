@@ -13,6 +13,13 @@ from app.services import session_manager
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
 
+def _num(val: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(val or 0))
+    except Exception:
+        return default
+
+
 async def _require_session(db: AsyncSession, user_id: int, client_db_id: int):
     session = await session_manager.get_client(user_id, client_db_id)
     if not session:
@@ -40,14 +47,17 @@ async def _get_first_live_client(db: AsyncSession, user_id: int):
 def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """
     Transform MOFSL getposition response into {open: [...], closed: [...]}.
-    MOFSL actual fields (from API docs):
-      symbol, exchange, clientcode, productname, symboltoken,
+    MOFSL actual fields:
+      symbol, scripname, exchange, clientcode, productname, symboltoken,
       buyquantity, buyamount, sellquantity, sellamount,
       daybuyquantity, daybuyamount, daysellquantity, daysellamount,
       LTP, marktomarket, bookedprofitloss,
       cfbuyquantity, cfbuyamount, cfsellquantity, cfsellamount,
       actualbookedprofitloss, actualmarktomarket,
       series, expirydate, strikeprice, optiontype
+
+    For OPEN positions: Net P&L = (LTP - buy_avg) * net_qty
+    For CLOSED positions: Net P&L = bookedprofitloss
     Net qty = buyquantity - sellquantity
     """
     open_pos: List[Dict[str, Any]] = []
@@ -61,12 +71,6 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         data = []
 
     for item in data:
-        def _num(val: Any, default: float = 0.0) -> float:
-            try:
-                return float(str(val or 0))
-            except Exception:
-                return default
-
         buy_qty = _num(item.get("buyquantity") or item.get("daybuyquantity") or 0)
         sell_qty = _num(item.get("sellquantity") or item.get("daysellquantity") or 0)
         net_qty = buy_qty - sell_qty
@@ -78,29 +82,49 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         sell_avg = round(sell_amt / sell_qty, 2) if sell_qty else 0
 
         ltp = _num(item.get("LTP") or item.get("ltp") or 0)
-        mtm = _num(item.get("marktomarket") or item.get("actualmarktomarket") or item.get("mtm") or 0)
-        booked_pnl = _num(item.get("bookedprofitloss") or item.get("actualbookedprofitloss") or 0)
+        booked_pnl = _num(
+            item.get("bookedprofitloss")
+            or item.get("actualbookedprofitloss")
+            or 0
+        )
+        mtm = _num(
+            item.get("marktomarket")
+            or item.get("actualmarktomarket")
+            or item.get("mtm")
+            or 0
+        )
 
-        # Build display name with expiry for F&O
+        # Build display name — use scripname which has full name, fall back to symbol
         symbol = item.get("symbol") or ""
+        scripname = item.get("scripname") or item.get("symbolname") or symbol
         series = item.get("series") or ""
         expiry = item.get("expirydate") or ""
         strike = item.get("strikeprice") or ""
         opt_type = item.get("optiontype") or ""
-        if series not in ("EQ", "") and expiry and expiry != "0":
-            name = f"{symbol} {expiry}"
+
+        if series not in ("EQ", "") and expiry and str(expiry) != "0":
+            name = f"{scripname} {expiry}"
             if strike and str(strike) != "0":
                 name += f" {strike} {opt_type}"
         else:
-            name = symbol
+            name = scripname
+
+        # P&L calculation:
+        # Open: unrealised = (LTP - buy_avg) * net_qty + booked_pnl
+        # Closed: only booked_pnl matters
+        if net_qty_int != 0 and ltp and buy_avg:
+            unrealised = round((ltp - buy_avg) * net_qty_int, 2)
+            net_profit = round(unrealised + booked_pnl, 2)
+        else:
+            net_profit = round(booked_pnl or mtm, 2)
 
         position = {
-            "name": name or item.get("symbolname") or symbol,
+            "name": name,
             "symbol": symbol,
             "quantity": net_qty_int,
             "buy_avg": buy_avg,
             "sell_avg": sell_avg,
-            "net_profit": round(mtm + booked_pnl, 2),
+            "net_profit": net_profit,
             "ltp": ltp,
             "day_pnl": round(mtm, 2),
         }
@@ -116,10 +140,17 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
 def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Transform MOFSL getdpholding response into a flat list.
-    MOFSL holding fields (common): symbol, symbolname/scripname,
-      holdingqty / quantity, avgcostprice / avgprice / averageprice,
-      LTP / ltp, currentmarketvalue, profitandloss / unrealisedpnl,
-      pnlpercentage
+    MOFSL actual fields (from API docs):
+      clientcode, scripisinno, dpquantity, blockedquantity,
+      scripname, buyavgprice, poaquantity, collateralquantity,
+      outstandingquantity, debitstockquantity, nonpoaquantity,
+      rmssellingquantity, btstquantity, buybackquantity,
+      tpinquantity, slbmquantity, nbfcquantity,
+      bsescripcode, nsesymboltoken
+
+    Note: MOFSL DP Holding does NOT return LTP or current market value.
+    Quantity is dpquantity. Avg cost is buyavgprice.
+    P&L cannot be computed without LTP — show 0 unless available.
     """
     if raw.get("status") != "SUCCESS":
         return []
@@ -129,48 +160,51 @@ def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     holdings = []
     for item in data:
-        def _num(val: Any, default: float = 0.0) -> float:
-            try:
-                return float(str(val or 0))
-            except Exception:
-                return default
-
+        # Actual MOFSL DP holding fields
         qty = _num(
-            item.get("holdingqty")
+            item.get("dpquantity")
+            or item.get("holdingqty")
             or item.get("quantity")
             or item.get("totalholdingqty")
             or 0
         )
         buy_avg = _num(
-            item.get("avgcostprice")
+            item.get("buyavgprice")       # actual MOFSL field
+            or item.get("avgcostprice")
             or item.get("averageprice")
             or item.get("avgprice")
             or 0
         )
+        # LTP and market value — may not be present in DP holding response
         ltp = _num(item.get("LTP") or item.get("ltp") or 0)
         current_val = _num(
             item.get("currentmarketvalue")
-            or (ltp * qty if ltp and qty else 0)
+            or (round(ltp * qty, 2) if ltp and qty else 0)
         )
+        invested_val = round(buy_avg * qty, 2) if buy_avg and qty else 0
         pnl = _num(
             item.get("profitandloss")
             or item.get("unrealisedpnl")
             or item.get("pnl")
-            or (current_val - buy_avg * qty if buy_avg and qty else 0)
+            or (round(current_val - invested_val, 2) if current_val and invested_val else 0)
         )
         pnl_pct = _num(
             item.get("pnlpercentage")
             or item.get("pnlpct")
-            or (round(pnl / (buy_avg * qty) * 100, 2) if buy_avg and qty else 0)
+            or (round(pnl / invested_val * 100, 2) if invested_val else 0)
         )
 
+        # Name: use scripname (full name from MOFSL), symbol from bsescripcode/nsesymboltoken context
+        name = item.get("scripname") or item.get("symbolname") or item.get("symbol") or ""
+        symbol = item.get("symbol") or item.get("scripname") or ""
+
         holdings.append({
-            "name": item.get("symbolname") or item.get("scripname") or item.get("symbol") or "",
-            "symbol": item.get("symbol") or "",
+            "name": name,
+            "symbol": symbol,
             "quantity": int(qty),
             "buy_avg": buy_avg,
             "ltp": ltp,
-            "current_value": round(current_val, 2),
+            "current_value": current_val,
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
         })
