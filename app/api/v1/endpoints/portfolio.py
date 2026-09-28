@@ -40,9 +40,15 @@ async def _get_first_live_client(db: AsyncSession, user_id: int):
 def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """
     Transform MOFSL getposition response into {open: [...], closed: [...]}.
-    MOFSL returns: {"status": "SUCCESS", "data": [...]}
-    Each item has fields like scripname, symbol, buyqty, sellqty, netqty,
-    buyavgprice, sellavgprice, mtm, etc.
+    MOFSL actual fields (from API docs):
+      symbol, exchange, clientcode, productname, symboltoken,
+      buyquantity, buyamount, sellquantity, sellamount,
+      daybuyquantity, daybuyamount, daysellquantity, daysellamount,
+      LTP, marktomarket, bookedprofitloss,
+      cfbuyquantity, cfbuyamount, cfsellquantity, cfsellamount,
+      actualbookedprofitloss, actualmarktomarket,
+      series, expirydate, strikeprice, optiontype
+    Net qty = buyquantity - sellquantity
     """
     open_pos: List[Dict[str, Any]] = []
     closed_pos: List[Dict[str, Any]] = []
@@ -55,21 +61,48 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         data = []
 
     for item in data:
-        net_qty = item.get("netqty", 0)
-        try:
-            net_qty_int = int(float(str(net_qty or 0)))
-        except Exception:
-            net_qty_int = 0
+        def _num(val: Any, default: float = 0.0) -> float:
+            try:
+                return float(str(val or 0))
+            except Exception:
+                return default
+
+        buy_qty = _num(item.get("buyquantity") or item.get("daybuyquantity") or 0)
+        sell_qty = _num(item.get("sellquantity") or item.get("daysellquantity") or 0)
+        net_qty = buy_qty - sell_qty
+        net_qty_int = int(net_qty)
+
+        buy_amt = _num(item.get("buyamount") or item.get("daybuyamount") or 0)
+        sell_amt = _num(item.get("sellamount") or item.get("daysellamount") or 0)
+        buy_avg = round(buy_amt / buy_qty, 2) if buy_qty else 0
+        sell_avg = round(sell_amt / sell_qty, 2) if sell_qty else 0
+
+        ltp = _num(item.get("LTP") or item.get("ltp") or 0)
+        mtm = _num(item.get("marktomarket") or item.get("actualmarktomarket") or item.get("mtm") or 0)
+        booked_pnl = _num(item.get("bookedprofitloss") or item.get("actualbookedprofitloss") or 0)
+
+        # Build display name with expiry for F&O
+        symbol = item.get("symbol") or ""
+        series = item.get("series") or ""
+        expiry = item.get("expirydate") or ""
+        strike = item.get("strikeprice") or ""
+        opt_type = item.get("optiontype") or ""
+        if series not in ("EQ", "") and expiry and expiry != "0":
+            name = f"{symbol} {expiry}"
+            if strike and str(strike) != "0":
+                name += f" {strike} {opt_type}"
+        else:
+            name = symbol
 
         position = {
-            "name": item.get("scripname") or item.get("symbolname") or item.get("symbol") or "",
-            "symbol": item.get("symbol") or item.get("scripname") or "",
+            "name": name or item.get("symbolname") or symbol,
+            "symbol": symbol,
             "quantity": net_qty_int,
-            "buy_avg": item.get("buyavgprice") or item.get("avgbuyPrice") or 0,
-            "sell_avg": item.get("sellavgprice") or item.get("avgsellPrice") or 0,
-            "net_profit": item.get("mtm") or item.get("realisedprofitloss") or 0,
-            "ltp": item.get("ltp") or 0,
-            "day_pnl": item.get("mtm") or 0,
+            "buy_avg": buy_avg,
+            "sell_avg": sell_avg,
+            "net_profit": round(mtm + booked_pnl, 2),
+            "ltp": ltp,
+            "day_pnl": round(mtm, 2),
         }
 
         if net_qty_int != 0:
@@ -81,7 +114,13 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Transform MOFSL getdpholding response into a flat list."""
+    """
+    Transform MOFSL getdpholding response into a flat list.
+    MOFSL holding fields (common): symbol, symbolname/scripname,
+      holdingqty / quantity, avgcostprice / avgprice / averageprice,
+      LTP / ltp, currentmarketvalue, profitandloss / unrealisedpnl,
+      pnlpercentage
+    """
     if raw.get("status") != "SUCCESS":
         return []
     data = raw.get("data") or []
@@ -90,15 +129,50 @@ def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     holdings = []
     for item in data:
+        def _num(val: Any, default: float = 0.0) -> float:
+            try:
+                return float(str(val or 0))
+            except Exception:
+                return default
+
+        qty = _num(
+            item.get("holdingqty")
+            or item.get("quantity")
+            or item.get("totalholdingqty")
+            or 0
+        )
+        buy_avg = _num(
+            item.get("avgcostprice")
+            or item.get("averageprice")
+            or item.get("avgprice")
+            or 0
+        )
+        ltp = _num(item.get("LTP") or item.get("ltp") or 0)
+        current_val = _num(
+            item.get("currentmarketvalue")
+            or (ltp * qty if ltp and qty else 0)
+        )
+        pnl = _num(
+            item.get("profitandloss")
+            or item.get("unrealisedpnl")
+            or item.get("pnl")
+            or (current_val - buy_avg * qty if buy_avg and qty else 0)
+        )
+        pnl_pct = _num(
+            item.get("pnlpercentage")
+            or item.get("pnlpct")
+            or (round(pnl / (buy_avg * qty) * 100, 2) if buy_avg and qty else 0)
+        )
+
         holdings.append({
-            "name": item.get("scripname") or item.get("symbolname") or "",
+            "name": item.get("symbolname") or item.get("scripname") or item.get("symbol") or "",
             "symbol": item.get("symbol") or "",
-            "quantity": item.get("holdingqty") or item.get("quantity") or 0,
-            "buy_avg": item.get("avgcostprice") or item.get("avgprice") or 0,
-            "ltp": item.get("ltp") or 0,
-            "current_value": item.get("currentmarketvalue") or 0,
-            "pnl": item.get("profitandloss") or item.get("unrealisedpnl") or 0,
-            "pnl_pct": item.get("pnlpercentage") or 0,
+            "quantity": int(qty),
+            "buy_avg": buy_avg,
+            "ltp": ltp,
+            "current_value": round(current_val, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
         })
     return holdings
 
