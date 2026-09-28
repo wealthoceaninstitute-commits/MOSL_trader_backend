@@ -69,9 +69,6 @@ def _parse_positions(raw: Dict[str, Any], client_name: str) -> Dict[str, List[Di
     open_pos: List[Dict[str, Any]] = []
     closed_pos: List[Dict[str, Any]] = []
 
-    if raw.get("status") != "SUCCESS":
-        return {"open": open_pos, "closed": closed_pos}
-
     data = raw.get("data") or []
     if not isinstance(data, list):
         data = []
@@ -86,7 +83,7 @@ def _parse_positions(raw: Dict[str, Any], client_name: str) -> Dict[str, List[Di
         buy_avg = round(buy_amt / buy_qty, 2) if buy_qty else 0
         sell_avg = round(sell_amt / sell_qty, 2) if sell_qty else 0
 
-        ltp = round(_num(item.get("LTP") or item.get("ltp") or 0) / 100, 2)  # MOFSL returns paise
+        ltp = round(_num(item.get("LTP") or item.get("ltp") or 0), 2)  # positions LTP already in rupees
         booked_pnl = _num(
             item.get("bookedprofitloss") or item.get("actualbookedprofitloss") or 0
         )
@@ -198,11 +195,12 @@ def _parse_holdings(
     symbol = scripname from MOFSL (e.g. "RELAXO EQ")
     LTP fetched separately via nsesymboltoken
     """
-    if raw.get("status") != "SUCCESS":
-        return []
     data = raw.get("data") or []
     if not isinstance(data, list):
         data = []
+    # If no data rows, bail early (don't require status==SUCCESS since MOFSL varies)
+    if not data:
+        return []
 
     if ltp_map is None:
         ltp_map = {}
