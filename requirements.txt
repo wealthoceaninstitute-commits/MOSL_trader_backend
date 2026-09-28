@@ -20,3 +20,4 @@ pandas
 requests
 geocoder
 websocket-client
+sqlalchemy[asyncio]
