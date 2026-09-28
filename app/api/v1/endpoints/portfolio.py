@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,7 +29,7 @@ async def _require_session(db: AsyncSession, user_id: int, client_db_id: int):
 
 
 async def _get_first_live_client(db: AsyncSession, user_id: int):
-    """Return the first live+active client for this user, or raise 400."""
+    """Return (MofslClient db row, session dict) for first active live client."""
     result = await db.execute(
         select(MofslClient).where(
             MofslClient.user_id == user_id,
@@ -40,25 +41,30 @@ async def _get_first_live_client(db: AsyncSession, user_id: int):
     for client in clients:
         session = await session_manager.get_client(user_id, client.id)
         if session:
-            return client.id, session
+            return client, session
     raise HTTPException(status_code=400, detail="No live client session found. Please log in a client first.")
 
 
-def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+async def _get_client_by_db_id(db: AsyncSession, client_db_id: int) -> Optional[MofslClient]:
+    result = await db.execute(select(MofslClient).where(MofslClient.id == client_db_id))
+    return result.scalar_one_or_none()
+
+
+def _parse_positions(raw: Dict[str, Any], client_name: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Transform MOFSL getposition response into {open: [...], closed: [...]}.
-    MOFSL actual fields:
-      symbol, scripname, exchange, clientcode, productname, symboltoken,
+    Uses client_name from DB for the 'name' field (not symbol/scripname).
+
+    MOFSL fields:
+      symbol, scripname, exchange, clientcode,
       buyquantity, buyamount, sellquantity, sellamount,
-      daybuyquantity, daybuyamount, daysellquantity, daysellamount,
       LTP, marktomarket, bookedprofitloss,
-      cfbuyquantity, cfbuyamount, cfsellquantity, cfsellamount,
       actualbookedprofitloss, actualmarktomarket,
       series, expirydate, strikeprice, optiontype
 
-    For OPEN positions: Net P&L = (LTP - buy_avg) * net_qty
-    For CLOSED positions: Net P&L = bookedprofitloss
     Net qty = buyquantity - sellquantity
+    Open P&L  = (LTP - buy_avg) * net_qty + booked_pnl
+    Closed P&L = booked_pnl
     """
     open_pos: List[Dict[str, Any]] = []
     closed_pos: List[Dict[str, Any]] = []
@@ -73,8 +79,7 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     for item in data:
         buy_qty = _num(item.get("buyquantity") or item.get("daybuyquantity") or 0)
         sell_qty = _num(item.get("sellquantity") or item.get("daysellquantity") or 0)
-        net_qty = buy_qty - sell_qty
-        net_qty_int = int(net_qty)
+        net_qty_int = int(buy_qty - sell_qty)
 
         buy_amt = _num(item.get("buyamount") or item.get("daybuyamount") or 0)
         sell_amt = _num(item.get("sellamount") or item.get("daysellamount") or 0)
@@ -83,18 +88,13 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
 
         ltp = _num(item.get("LTP") or item.get("ltp") or 0)
         booked_pnl = _num(
-            item.get("bookedprofitloss")
-            or item.get("actualbookedprofitloss")
-            or 0
+            item.get("bookedprofitloss") or item.get("actualbookedprofitloss") or 0
         )
         mtm = _num(
-            item.get("marktomarket")
-            or item.get("actualmarktomarket")
-            or item.get("mtm")
-            or 0
+            item.get("marktomarket") or item.get("actualmarktomarket") or item.get("mtm") or 0
         )
 
-        # Build display name — use scripname which has full name, fall back to symbol
+        # Symbol display (F&O gets expiry/strike appended)
         symbol = item.get("symbol") or ""
         scripname = item.get("scripname") or item.get("symbolname") or symbol
         series = item.get("series") or ""
@@ -103,24 +103,21 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         opt_type = item.get("optiontype") or ""
 
         if series not in ("EQ", "") and expiry and str(expiry) != "0":
-            name = f"{scripname} {expiry}"
+            display_symbol = f"{symbol} {expiry}"
             if strike and str(strike) != "0":
-                name += f" {strike} {opt_type}"
+                display_symbol += f" {strike} {opt_type}"
         else:
-            name = scripname
+            display_symbol = scripname  # e.g. "M&M EQ"
 
-        # P&L calculation:
-        # Open: unrealised = (LTP - buy_avg) * net_qty + booked_pnl
-        # Closed: only booked_pnl matters
+        # P&L
         if net_qty_int != 0 and ltp and buy_avg:
-            unrealised = round((ltp - buy_avg) * net_qty_int, 2)
-            net_profit = round(unrealised + booked_pnl, 2)
+            net_profit = round((ltp - buy_avg) * net_qty_int + booked_pnl, 2)
         else:
             net_profit = round(booked_pnl or mtm, 2)
 
         position = {
-            "name": name,
-            "symbol": symbol,
+            "name": client_name,        # Client name from DB
+            "symbol": display_symbol,   # e.g. "M&M EQ" or "NIFTY 25DEC2025 24000 CE"
             "quantity": net_qty_int,
             "buy_avg": buy_avg,
             "sell_avg": sell_avg,
@@ -137,20 +134,66 @@ def _parse_positions(raw: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     return {"open": open_pos, "closed": closed_pos}
 
 
-def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _fetch_ltp_for_holdings(
+    holdings_data: List[Dict[str, Any]],
+    svc: Any,
+    auth_token: str,
+    access_token: str,
+) -> Dict[int, float]:
+    """
+    Fetch LTP for each holding using nsesymboltoken (NSE scripcode).
+    Returns dict of {nsesymboltoken: ltp}.
+    """
+    ltp_map: Dict[int, float] = {}
+
+    async def fetch_one(token: int) -> None:
+        try:
+            resp = await svc.get_ltp(auth_token, access_token, "NSE", token)
+            if resp.get("status") == "SUCCESS":
+                data = resp.get("data") or {}
+                if isinstance(data, list) and data:
+                    data = data[0]
+                ltp_val = _num(
+                    data.get("LTP") or data.get("ltp")
+                    or data.get("lastprice") or data.get("close") or 0
+                )
+                if ltp_val:
+                    ltp_map[token] = ltp_val
+        except Exception:
+            pass  # LTP fetch failure is non-critical
+
+    tokens = []
+    for item in holdings_data:
+        tok = item.get("nsesymboltoken") or item.get("bsescripcode")
+        if tok:
+            try:
+                tokens.append(int(tok))
+            except Exception:
+                pass
+
+    # Fetch concurrently but limit parallelism to avoid rate limits
+    for i in range(0, len(tokens), 5):
+        batch = tokens[i:i+5]
+        await asyncio.gather(*[fetch_one(t) for t in batch])
+
+    return ltp_map
+
+
+def _parse_holdings(
+    raw: Dict[str, Any],
+    client_name: str,
+    ltp_map: Optional[Dict[int, float]] = None,
+) -> List[Dict[str, Any]]:
     """
     Transform MOFSL getdpholding response into a flat list.
-    MOFSL actual fields (from API docs):
+    MOFSL actual fields:
       clientcode, scripisinno, dpquantity, blockedquantity,
       scripname, buyavgprice, poaquantity, collateralquantity,
-      outstandingquantity, debitstockquantity, nonpoaquantity,
-      rmssellingquantity, btstquantity, buybackquantity,
-      tpinquantity, slbmquantity, nbfcquantity,
-      bsescripcode, nsesymboltoken
+      nsesymboltoken, bsescripcode
 
-    Note: MOFSL DP Holding does NOT return LTP or current market value.
-    Quantity is dpquantity. Avg cost is buyavgprice.
-    P&L cannot be computed without LTP — show 0 unless available.
+    name = client name from DB
+    symbol = scripname from MOFSL (e.g. "RELAXO EQ")
+    LTP fetched separately via nsesymboltoken
     """
     if raw.get("status") != "SUCCESS":
         return []
@@ -158,55 +201,47 @@ def _parse_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         data = []
 
+    if ltp_map is None:
+        ltp_map = {}
+
     holdings = []
     for item in data:
-        # Actual MOFSL DP holding fields
         qty = _num(
             item.get("dpquantity")
             or item.get("holdingqty")
             or item.get("quantity")
-            or item.get("totalholdingqty")
             or 0
         )
         buy_avg = _num(
-            item.get("buyavgprice")       # actual MOFSL field
+            item.get("buyavgprice")
             or item.get("avgcostprice")
             or item.get("averageprice")
-            or item.get("avgprice")
             or 0
         )
-        # LTP and market value — may not be present in DP holding response
-        ltp = _num(item.get("LTP") or item.get("ltp") or 0)
-        current_val = _num(
-            item.get("currentmarketvalue")
-            or (round(ltp * qty, 2) if ltp and qty else 0)
-        )
-        invested_val = round(buy_avg * qty, 2) if buy_avg and qty else 0
-        pnl = _num(
-            item.get("profitandloss")
-            or item.get("unrealisedpnl")
-            or item.get("pnl")
-            or (round(current_val - invested_val, 2) if current_val and invested_val else 0)
-        )
-        pnl_pct = _num(
-            item.get("pnlpercentage")
-            or item.get("pnlpct")
-            or (round(pnl / invested_val * 100, 2) if invested_val else 0)
-        )
+        # Get LTP from our fetched map using nsesymboltoken
+        nse_token = None
+        try:
+            nse_token = int(item.get("nsesymboltoken") or item.get("bsescripcode") or 0)
+        except Exception:
+            pass
+        ltp = ltp_map.get(nse_token, 0.0) if nse_token else 0.0
 
-        # Name: use scripname (full name from MOFSL), symbol from bsescripcode/nsesymboltoken context
-        name = item.get("scripname") or item.get("symbolname") or item.get("symbol") or ""
-        symbol = item.get("symbol") or item.get("scripname") or ""
+        invested_val = round(buy_avg * qty, 2) if buy_avg and qty else 0.0
+        current_val = round(ltp * qty, 2) if ltp and qty else 0.0
+        pnl = round(current_val - invested_val, 2) if current_val and invested_val else 0.0
+        pnl_pct = round(pnl / invested_val * 100, 2) if invested_val else 0.0
+
+        scripname = item.get("scripname") or item.get("symbolname") or item.get("symbol") or ""
 
         holdings.append({
-            "name": name,
-            "symbol": symbol,
+            "name": client_name,    # Client name from DB
+            "symbol": scripname,    # e.g. "RELAXO EQ" or "MOSCHIP EQ"
             "quantity": int(qty),
             "buy_avg": buy_avg,
             "ltp": ltp,
             "current_value": current_val,
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
         })
     return holdings
 
@@ -219,13 +254,16 @@ async def positions(
 ) -> Dict[str, Any]:
     if client_id is not None:
         session = await _require_session(db, current_user.id, client_id)
+        client_row = await _get_client_by_db_id(db, client_id)
+        client_name = client_row.name if client_row else "Unknown"
     else:
-        _, session = await _get_first_live_client(db, current_user.id)
+        client_row, session = await _get_first_live_client(db, current_user.id)
+        client_name = client_row.name
 
     svc = session["service"]
     try:
         raw = await svc.get_positions(session["auth_token"], session["access_token"])
-        return _parse_positions(raw)
+        return _parse_positions(raw, client_name)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -238,13 +276,24 @@ async def holdings(
 ) -> Dict[str, Any]:
     if client_id is not None:
         session = await _require_session(db, current_user.id, client_id)
+        client_row = await _get_client_by_db_id(db, client_id)
+        client_name = client_row.name if client_row else "Unknown"
     else:
-        _, session = await _get_first_live_client(db, current_user.id)
+        client_row, session = await _get_first_live_client(db, current_user.id)
+        client_name = client_row.name
 
     svc = session["service"]
     try:
         raw = await svc.get_holdings(session["auth_token"], session["access_token"])
-        return {"holdings": _parse_holdings(raw)}
+        holdings_data = raw.get("data") or []
+        if not isinstance(holdings_data, list):
+            holdings_data = []
+
+        # Fetch LTP for all holdings concurrently using nsesymboltoken
+        ltp_map = await _fetch_ltp_for_holdings(
+            holdings_data, svc, session["auth_token"], session["access_token"]
+        )
+        return {"holdings": _parse_holdings(raw, client_name, ltp_map)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -272,10 +321,7 @@ async def portfolio_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    """
-    Aggregated summary across all live clients for this user.
-    Fetches margin summary from each live client and combines with DB capital.
-    """
+    """Aggregated summary across all live clients for this user."""
     result = await db.execute(
         select(MofslClient).where(
             MofslClient.user_id == current_user.id,
