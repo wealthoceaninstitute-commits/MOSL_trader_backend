@@ -86,7 +86,7 @@ def _parse_positions(raw: Dict[str, Any], client_name: str) -> Dict[str, List[Di
         buy_avg = round(buy_amt / buy_qty, 2) if buy_qty else 0
         sell_avg = round(sell_amt / sell_qty, 2) if sell_qty else 0
 
-        ltp = _num(item.get("LTP") or item.get("ltp") or 0)
+        ltp = round(_num(item.get("LTP") or item.get("ltp") or 0) / 100, 2)  # MOFSL returns paise
         booked_pnl = _num(
             item.get("bookedprofitloss") or item.get("actualbookedprofitloss") or 0
         )
@@ -153,12 +153,12 @@ async def _fetch_ltp_for_holdings(
                 data = resp.get("data") or {}
                 if isinstance(data, list) and data:
                     data = data[0]
-                ltp_val = _num(
+                ltp_raw = _num(
                     data.get("LTP") or data.get("ltp")
                     or data.get("lastprice") or data.get("close") or 0
                 )
-                if ltp_val:
-                    ltp_map[token] = ltp_val
+                if ltp_raw:
+                    ltp_map[token] = round(ltp_raw / 100, 2)  # MOFSL returns paise
         except Exception:
             pass  # LTP fetch failure is non-critical
 
