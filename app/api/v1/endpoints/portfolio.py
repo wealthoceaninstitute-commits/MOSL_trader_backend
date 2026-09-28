@@ -148,7 +148,10 @@ async def _fetch_ltp_for_holdings(
 
     async def fetch_one(token: int) -> None:
         try:
-            resp = await svc.get_ltp(auth_token, access_token, "NSE", token)
+            resp = await asyncio.wait_for(
+                svc.get_ltp(auth_token, access_token, "NSE", token),
+                timeout=3.0,
+            )
             if resp.get("status") == "SUCCESS":
                 data = resp.get("data") or {}
                 if isinstance(data, list) and data:
@@ -290,9 +293,16 @@ async def holdings(
             holdings_data = []
 
         # Fetch LTP for all holdings concurrently using nsesymboltoken
-        ltp_map = await _fetch_ltp_for_holdings(
-            holdings_data, svc, session["auth_token"], session["access_token"]
-        )
+        # Wrap in timeout so holdings still render if LTP fetch hangs (e.g. after market hours)
+        try:
+            ltp_map = await asyncio.wait_for(
+                _fetch_ltp_for_holdings(
+                    holdings_data, svc, session["auth_token"], session["access_token"]
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            ltp_map = {}
         return {"holdings": _parse_holdings(raw, client_name, ltp_map)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
